@@ -1,7 +1,7 @@
 import streamlit as st
 import PyPDF2
-import chromadb
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 import io
 import re
 import time
@@ -26,10 +26,10 @@ if 'qa_history' not in st.session_state:
     st.session_state.qa_history = []
 if 'embedder' not in st.session_state:
     st.session_state.embedder = None
-if 'chroma_client' not in st.session_state:
-    st.session_state.chroma_client = None
-if 'collection' not in st.session_state:
-    st.session_state.collection = None
+if 'chunks_data' not in st.session_state:
+    st.session_state.chunks_data = []
+if 'embeddings_matrix' not in st.session_state:
+    st.session_state.embeddings_matrix = None
 
 class SmartRAGSystem:
     def __init__(self):
@@ -40,18 +40,6 @@ class SmartRAGSystem:
     def load_embedder():
         """Load embedding model with caching"""
         return SentenceTransformer('all-MiniLM-L6-v2')
-    
-    def initialize_chroma(self):
-        """Initialize ChromaDB"""
-        if st.session_state.chroma_client is None:
-            st.session_state.chroma_client = chromadb.Client()
-            try:
-                st.session_state.collection = st.session_state.chroma_client.create_collection(
-                    name="documents",
-                    metadata={"description": "Document chunks for RAG"}
-                )
-            except:
-                st.session_state.collection = st.session_state.chroma_client.get_collection("documents")
     
     def extract_text_from_pdf(self, pdf_file) -> str:
         """Extract text from PDF file"""
@@ -108,17 +96,17 @@ class SmartRAGSystem:
     
     def simple_sentiment_analysis(self, text: str) -> Dict:
         """Simple rule-based sentiment analysis"""
-        positive_words = ['good', 'great', 'excellent', 'amazing', 'wonderful', 'fantastic', 'positive', 'success', 'effective', 'beneficial']
-        negative_words = ['bad', 'terrible', 'awful', 'horrible', 'negative', 'failure', 'ineffective', 'harmful', 'poor', 'disappointing']
+        positive_words = ['good', 'great', 'excellent', 'amazing', 'wonderful', 'fantastic', 'positive', 'success', 'effective', 'beneficial', 'improved', 'better', 'best', 'optimal', 'superior']
+        negative_words = ['bad', 'terrible', 'awful', 'horrible', 'negative', 'failure', 'ineffective', 'harmful', 'poor', 'disappointing', 'worse', 'worst', 'inferior', 'problematic', 'issue']
         
         text_lower = text.lower()
         positive_count = sum(1 for word in positive_words if word in text_lower)
         negative_count = sum(1 for word in negative_words if word in text_lower)
         
         if positive_count > negative_count:
-            return {'label': 'POSITIVE', 'score': 0.7 + (positive_count * 0.1)}
+            return {'label': 'POSITIVE', 'score': min(0.95, 0.6 + (positive_count * 0.1))}
         elif negative_count > positive_count:
-            return {'label': 'NEGATIVE', 'score': 0.7 + (negative_count * 0.1)}
+            return {'label': 'NEGATIVE', 'score': min(0.95, 0.6 + (negative_count * 0.1))}
         else:
             return {'label': 'NEUTRAL', 'score': 0.5}
     
@@ -126,26 +114,32 @@ class SmartRAGSystem:
         """Simple entity extraction using regex patterns"""
         entities = {}
         
-        # Extract dates
-        date_pattern = r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}\b'
-        dates = re.findall(date_pattern, text)
-        if dates:
-            entities['DATES'] = list(set(dates))
+        # Extract years
+        year_pattern = r'\b(19|20)\d{2}\b'
+        years = re.findall(year_pattern, text)
+        if years:
+            entities['YEARS'] = list(set([''.join(year) for year in years]))
+        
+        # Extract percentages
+        percentage_pattern = r'\b\d+(?:\.\d+)?%'
+        percentages = re.findall(percentage_pattern, text)
+        if percentages:
+            entities['PERCENTAGES'] = list(set(percentages))
         
         # Extract capitalized words (potential names/organizations)
         name_pattern = r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b'
         names = re.findall(name_pattern, text)
         # Filter out common words
-        common_words = {'The', 'This', 'That', 'And', 'Or', 'But', 'In', 'On', 'At', 'To', 'For', 'Of', 'With', 'By'}
+        common_words = {'The', 'This', 'That', 'And', 'Or', 'But', 'In', 'On', 'At', 'To', 'For', 'Of', 'With', 'By', 'From', 'According', 'Based', 'Document'}
         names = [name for name in names if name not in common_words and len(name) > 2]
         if names:
-            entities['NAMES'] = list(set(names))
+            entities['KEY_TERMS'] = list(set(names[:10]))  # Limit to top 10
         
-        # Extract numbers
-        number_pattern = r'\b\d+(?:\.\d+)?%?\b'
-        numbers = re.findall(number_pattern, text)
+        # Extract numbers with units
+        number_pattern = r'\b\d+(?:\.\d+)?\s*(?:million|billion|thousand|dollars?|euros?|pounds?|kg|meters?|miles?|years?|months?|days?)\b'
+        numbers = re.findall(number_pattern, text, re.IGNORECASE)
         if numbers:
-            entities['NUMBERS'] = list(set(numbers))
+            entities['MEASUREMENTS'] = list(set(numbers[:5]))  # Limit to top 5
         
         return entities
     
@@ -153,11 +147,11 @@ class SmartRAGSystem:
         """Simple question classification"""
         question_lower = question.lower()
         
-        if any(word in question_lower for word in ['what', 'define', 'explain', 'describe']):
+        if any(word in question_lower for word in ['what', 'define', 'explain', 'describe', 'who', 'where', 'when']):
             return "Factual"
-        elif any(word in question_lower for word in ['why', 'how', 'analyze', 'compare']):
+        elif any(word in question_lower for word in ['why', 'how', 'analyze', 'compare', 'evaluate']):
             return "Analytical"
-        elif any(word in question_lower for word in ['summarize', 'summary', 'overview', 'main']):
+        elif any(word in question_lower for word in ['summarize', 'summary', 'overview', 'main', 'key']):
             return "Summary"
         else:
             return "General"
@@ -183,23 +177,24 @@ class SmartRAGSystem:
         status_text.text("🧠 Generating embeddings...")
         progress_bar.progress(60)
         
-        embeddings = st.session_state.embedder.encode([chunk['text'] for chunk in chunks])
+        chunk_texts = [chunk['text'] for chunk in chunks]
+        embeddings = st.session_state.embedder.encode(chunk_texts)
         
-        # Store in ChromaDB
+        # Store in session state (simple vector store)
         status_text.text("💾 Storing in vector database...")
         progress_bar.progress(80)
         
-        # Prepare data for ChromaDB
-        ids = [f"{doc_name}_{i}" for i in range(len(chunks))]
-        documents = [chunk['text'] for chunk in chunks]
-        metadatas = [{'page': chunk['page'], 'document': chunk['document']} for chunk in chunks]
+        # Add to existing data
+        start_idx = len(st.session_state.chunks_data)
+        for i, chunk in enumerate(chunks):
+            chunk['embedding_idx'] = start_idx + i
+            st.session_state.chunks_data.append(chunk)
         
-        st.session_state.collection.add(
-            embeddings=embeddings.tolist(),
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids
-        )
+        # Update embeddings matrix
+        if st.session_state.embeddings_matrix is None:
+            st.session_state.embeddings_matrix = embeddings
+        else:
+            st.session_state.embeddings_matrix = np.vstack([st.session_state.embeddings_matrix, embeddings])
         
         progress_bar.progress(100)
         status_text.text("✅ Document processed successfully!")
@@ -218,26 +213,25 @@ class SmartRAGSystem:
     
     def retrieve_relevant_chunks(self, question: str, top_k: int = 3) -> List[Dict]:
         """Retrieve relevant chunks for question"""
-        if st.session_state.collection is None:
+        if not st.session_state.chunks_data or st.session_state.embeddings_matrix is None:
             return []
         
         # Generate question embedding
         question_embedding = st.session_state.embedder.encode([question])
         
-        # Search in ChromaDB
-        results = st.session_state.collection.query(
-            query_embeddings=question_embedding.tolist(),
-            n_results=top_k
-        )
+        # Calculate cosine similarities
+        similarities = cosine_similarity(question_embedding, st.session_state.embeddings_matrix)[0]
+        
+        # Get top-k most similar chunks
+        top_indices = np.argsort(similarities)[::-1][:top_k]
         
         relevant_chunks = []
-        for i in range(len(results['documents'][0])):
-            relevant_chunks.append({
-                'text': results['documents'][0][i],
-                'page': results['metadatas'][0][i]['page'],
-                'document': results['metadatas'][0][i]['document'],
-                'distance': results['distances'][0][i]
-            })
+        for idx in top_indices:
+            if similarities[idx] > 0.1:  # Minimum similarity threshold
+                chunk = st.session_state.chunks_data[idx].copy()
+                chunk['similarity'] = similarities[idx]
+                chunk['distance'] = 1 - similarities[idx]  # For compatibility
+                relevant_chunks.append(chunk)
         
         return relevant_chunks
     
@@ -252,23 +246,33 @@ class SmartRAGSystem:
         question_type = self.classify_question(question)
         
         if question_type == "Summary":
-            answer = f"Based on the document analysis:\n\n{context[:600]}..."
+            # For summary questions, provide an overview
+            answer = f"Based on the document analysis, here are the key points:\n\n{context[:600]}"
+            if len(context) > 600:
+                answer += "...\n\n[Answer truncated - full context available in sources below]"
         elif question_type == "Factual":
             # Look for direct answers
             sentences = context.split('.')
-            question_words = question.lower().split()
+            question_words = [w.lower() for w in question.split() if len(w) > 3]
             relevant_sentences = []
             
             for sentence in sentences:
-                if any(word in sentence.lower() for word in question_words if len(word) > 3):
-                    relevant_sentences.append(sentence.strip())
+                sentence = sentence.strip()
+                if sentence and any(word in sentence.lower() for word in question_words):
+                    relevant_sentences.append(sentence)
             
             if relevant_sentences:
                 answer = '. '.join(relevant_sentences[:3]) + '.'
             else:
-                answer = f"Based on the context: {context[:400]}..."
+                # Fallback to first part of most relevant chunk
+                answer = f"Based on the document: {relevant_chunks[0]['text'][:300]}"
+                if len(relevant_chunks[0]['text']) > 300:
+                    answer += "..."
         else:
-            answer = f"According to the document:\n\n{context[:500]}..."
+            # For analytical or general questions
+            answer = f"According to the document:\n\n{context[:500]}"
+            if len(context) > 500:
+                answer += "...\n\n[Full context available in sources below]"
         
         return answer
     
@@ -288,8 +292,8 @@ class SmartRAGSystem:
         # Calculate confidence (simple heuristic)
         confidence = 0.2
         if relevant_chunks:
-            avg_distance = sum(chunk['distance'] for chunk in relevant_chunks) / len(relevant_chunks)
-            confidence = max(0.2, min(0.95, 1.0 - avg_distance))
+            avg_similarity = sum(chunk['similarity'] for chunk in relevant_chunks) / len(relevant_chunks)
+            confidence = min(0.95, max(0.2, avg_similarity))
         
         # Process time
         process_time = time.time() - start_time
@@ -332,9 +336,7 @@ def main():
     if st.session_state.embedder is None:
         with st.spinner("🚀 Loading AI models... (This may take a minute on first run)"):
             st.session_state.embedder = SmartRAGSystem.load_embedder()
-    
-    # Initialize ChromaDB
-    rag_system.initialize_chroma()
+            st.success("✅ AI models loaded successfully!")
     
     # Sidebar
     st.sidebar.header("📁 Document Management")
@@ -379,7 +381,8 @@ def main():
                 "Summarize the key findings",
                 "What are the important dates mentioned?",
                 "What are the main conclusions?",
-                "Explain the methodology used"
+                "Explain the methodology used",
+                "What are the key statistics or numbers?"
             ]
             
             selected_question = st.selectbox("Select a sample question:", 
@@ -414,7 +417,7 @@ def main():
                     if result['sources']:
                         st.subheader("📚 Sources")
                         for i, source in enumerate(result['sources']):
-                            relevance = 1 - source['distance']
+                            relevance = source['similarity']
                             with st.expander(f"📄 Source {i+1} - Page {source['page']} (Relevance: {relevance:.1%})"):
                                 st.write(source['text'])
                     
@@ -428,7 +431,8 @@ def main():
                             if result['entities']:
                                 st.write("**🏷️ Key Information Extracted:**")
                                 for entity_type, entities in result['entities'].items():
-                                    st.write(f"- **{entity_type}**: {', '.join(set(entities))}")
+                                    if entities:  # Only show if not empty
+                                        st.write(f"- **{entity_type.replace('_', ' ').title()}**: {', '.join(entities)}")
                         
                         with analysis_col2:
                             if result['sentiment']:
@@ -448,18 +452,19 @@ def main():
             df = pd.DataFrame(st.session_state.documents)
             
             # Chunks chart
-            fig_chunks = px.bar(df, x='name', y='chunks', 
-                              title='Chunks per Document',
-                              labels={'name': 'Document', 'chunks': 'Number of Chunks'})
-            fig_chunks.update_layout(height=300)
-            st.plotly_chart(fig_chunks, use_container_width=True)
-            
-            # Character count
-            fig_chars = px.bar(df, x='name', y='text_length',
-                             title='Document Length (Characters)',
-                             labels={'name': 'Document', 'text_length': 'Characters'})
-            fig_chars.update_layout(height=300)
-            st.plotly_chart(fig_chars, use_container_width=True)
+            if len(df) > 0:
+                fig_chunks = px.bar(df, x='name', y='chunks', 
+                                  title='Chunks per Document',
+                                  labels={'name': 'Document', 'chunks': 'Number of Chunks'})
+                fig_chunks.update_layout(height=300)
+                st.plotly_chart(fig_chunks, use_container_width=True)
+                
+                # Character count
+                fig_chars = px.bar(df, x='name', y='text_length',
+                                 title='Document Length (Characters)',
+                                 labels={'name': 'Document', 'text_length': 'Characters'})
+                fig_chars.update_layout(height=300)
+                st.plotly_chart(fig_chars, use_container_width=True)
         
         # Q&A History
         if st.session_state.qa_history:
@@ -482,6 +487,18 @@ def main():
                                  title='Question Types Distribution')
                 fig_types.update_layout(height=300)
                 st.plotly_chart(fig_types, use_container_width=True)
+        
+        # Performance metrics
+        if st.session_state.qa_history:
+            st.subheader("⚡ Performance Metrics")
+            
+            avg_confidence = np.mean([qa['confidence'] for qa in st.session_state.qa_history])
+            avg_time = np.mean([qa['process_time'] for qa in st.session_state.qa_history])
+            total_questions = len(st.session_state.qa_history)
+            
+            st.metric("Average Confidence", f"{avg_confidence:.1%}")
+            st.metric("Average Response Time", f"{avg_time:.2f}s")
+            st.metric("Total Questions", total_questions)
     
     # Footer
     st.markdown("---")
@@ -497,7 +514,7 @@ def main():
     with col_tech2:
         st.markdown("**⚡ Tech Stack:**")
         st.markdown("- Streamlit Frontend")
-        st.markdown("- ChromaDB Vector Store")
+        st.markdown("- In-Memory Vector Store")
         st.markdown("- PyTorch Backend")
     
     with col_tech3:
