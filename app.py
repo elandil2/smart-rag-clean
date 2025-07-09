@@ -11,19 +11,9 @@ import pandas as pd
 import plotly.express as px
 import numpy as np
 
-# Try to import advanced NLP libraries
-try:
-    import spacy
-    SPACY_AVAILABLE = True
-except ImportError:
-    SPACY_AVAILABLE = False
-
-try:
-    import nltk
-    from nltk.tokenize import sent_tokenize, word_tokenize
-    NLTK_AVAILABLE = True
-except ImportError:
-    NLTK_AVAILABLE = False
+# Global flags for library availability
+SPACY_AVAILABLE = False
+NLTK_AVAILABLE = False
 import io
 import re
 import time
@@ -67,31 +57,43 @@ class AdvancedRAGSystem:
     @st.cache_resource
     def load_models():
         """Load all NLP models with caching and error handling"""
+        global SPACY_AVAILABLE, NLTK_AVAILABLE
+        
         try:
             # Load embedding model (this should always work)
             embedder = SentenceTransformer('all-mpnet-base-v2')
             
             # Try to load SpaCy model
             nlp = None
-            if SPACY_AVAILABLE:
-                try:
-                    nlp = spacy.load("en_core_web_sm")
-                except OSError:
-                    st.warning("SpaCy model not found. Using fallback NLP processing.")
-                    nlp = None
+            try:
+                import spacy
+                nlp = spacy.load("en_core_web_sm")
+                SPACY_AVAILABLE = True
+            except (ImportError, OSError):
+                st.warning("SpaCy not available. Using fallback NLP processing.")
+                SPACY_AVAILABLE = False
+                nlp = None
             
             # Try to setup NLTK
-            if NLTK_AVAILABLE:
+            try:
+                import nltk
+                from nltk.tokenize import sent_tokenize, word_tokenize
+                
+                # Try to download NLTK data if not available
                 try:
-                    # Try to download NLTK data if not available
-                    try:
-                        nltk.data.find('tokenizers/punkt')
-                    except LookupError:
-                        st.info("Downloading NLTK data... (one-time setup)")
-                        nltk.download('punkt', quiet=True)
-                        nltk.download('stopwords', quiet=True)
-                except Exception as e:
-                    st.warning(f"NLTK setup failed: {e}")
+                    nltk.data.find('tokenizers/punkt')
+                except LookupError:
+                    st.info("Downloading NLTK data... (one-time setup)")
+                    nltk.download('punkt', quiet=True)
+                    nltk.download('stopwords', quiet=True)
+                
+                NLTK_AVAILABLE = True
+            except ImportError:
+                st.info("NLTK not available. Using simple text processing.")
+                NLTK_AVAILABLE = False
+            except Exception as e:
+                st.warning(f"NLTK setup failed: {e}")
+                NLTK_AVAILABLE = False
             
             return embedder, nlp, True
             
@@ -153,6 +155,8 @@ class AdvancedRAGSystem:
         elif NLTK_AVAILABLE:
             # Use NLTK if available
             try:
+                import nltk
+                from nltk.tokenize import sent_tokenize
                 sentences = sent_tokenize(text)
             except:
                 # Fallback to simple splitting
@@ -170,13 +174,7 @@ class AdvancedRAGSystem:
         
         for sentence in sentences:
             # Calculate tokens (use NLTK if available, otherwise approximate)
-            if NLTK_AVAILABLE:
-                try:
-                    sentence_tokens = len(word_tokenize(sentence))
-                except:
-                    sentence_tokens = len(sentence.split())
-            else:
-                sentence_tokens = len(sentence.split())
+            sentence_tokens = self._count_tokens(sentence)
             
             # Check if adding this sentence exceeds our target
             if (current_chunk_tokens + sentence_tokens > self.max_chunk_tokens and 
