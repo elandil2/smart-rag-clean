@@ -39,7 +39,7 @@ class SmartRAGSystem:
     @st.cache_resource
     def load_embedder():
         """Load embedding model with caching"""
-        return SentenceTransformer('all-MiniLM-L6-v2')
+        return SentenceTransformer('all-mpnet-base-v2')
     
     def extract_text_from_pdf(self, pdf_file) -> str:
         """Extract text from PDF file"""
