@@ -2,9 +2,28 @@ import streamlit as st
 import PyPDF2
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-import spacy
-import nltk
-from nltk.tokenize import sent_tokenize, word_tokenize
+import io
+import re
+import time
+import hashlib
+from typing import List, Dict, Tuple
+import pandas as pd
+import plotly.express as px
+import numpy as np
+
+# Try to import advanced NLP libraries
+try:
+    import spacy
+    SPACY_AVAILABLE = True
+except ImportError:
+    SPACY_AVAILABLE = False
+
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize, word_tokenize
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
 import io
 import re
 import time
@@ -47,19 +66,32 @@ class AdvancedRAGSystem:
     
     @st.cache_resource
     def load_models():
-        """Load all NLP models with caching"""
+        """Load all NLP models with caching and error handling"""
         try:
-            # Download NLTK data
-            try:
-                nltk.data.find('tokenizers/punkt')
-            except LookupError:
-                nltk.download('punkt', quiet=True)
-            
-            # Load embedding model
+            # Load embedding model (this should always work)
             embedder = SentenceTransformer('all-mpnet-base-v2')
             
-            # Load SpaCy model  
-            nlp = spacy.load("en_core_web_sm")
+            # Try to load SpaCy model
+            nlp = None
+            if SPACY_AVAILABLE:
+                try:
+                    nlp = spacy.load("en_core_web_sm")
+                except OSError:
+                    st.warning("SpaCy model not found. Using fallback NLP processing.")
+                    nlp = None
+            
+            # Try to setup NLTK
+            if NLTK_AVAILABLE:
+                try:
+                    # Try to download NLTK data if not available
+                    try:
+                        nltk.data.find('tokenizers/punkt')
+                    except LookupError:
+                        st.info("Downloading NLTK data... (one-time setup)")
+                        nltk.download('punkt', quiet=True)
+                        nltk.download('stopwords', quiet=True)
+                except Exception as e:
+                    st.warning(f"NLTK setup failed: {e}")
             
             return embedder, nlp, True
             
@@ -111,16 +143,23 @@ class AdvancedRAGSystem:
         return chunks
     
     def _chunk_page_text(self, text: str, page_num: int, doc_name: str) -> List[Dict]:
-        """Chunk text from a single page using advanced NLP"""
+        """Chunk text from a single page using advanced NLP or fallback"""
         chunks = []
         
-        # Use SpaCy for better sentence segmentation
-        if st.session_state.nlp:
+        # Use SpaCy for better sentence segmentation if available
+        if st.session_state.nlp and SPACY_AVAILABLE:
             doc = st.session_state.nlp(text)
             sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+        elif NLTK_AVAILABLE:
+            # Use NLTK if available
+            try:
+                sentences = sent_tokenize(text)
+            except:
+                # Fallback to simple splitting
+                sentences = self._simple_sentence_split(text)
         else:
-            # Fallback to NLTK
-            sentences = sent_tokenize(text)
+            # Fallback to simple splitting
+            sentences = self._simple_sentence_split(text)
         
         if not sentences:
             return chunks
@@ -130,7 +169,14 @@ class AdvancedRAGSystem:
         current_chunk_tokens = 0
         
         for sentence in sentences:
-            sentence_tokens = len(word_tokenize(sentence))
+            # Calculate tokens (use NLTK if available, otherwise approximate)
+            if NLTK_AVAILABLE:
+                try:
+                    sentence_tokens = len(word_tokenize(sentence))
+                except:
+                    sentence_tokens = len(sentence.split())
+            else:
+                sentence_tokens = len(sentence.split())
             
             # Check if adding this sentence exceeds our target
             if (current_chunk_tokens + sentence_tokens > self.max_chunk_tokens and 
@@ -144,7 +190,7 @@ class AdvancedRAGSystem:
                 # Start new chunk with overlap
                 overlap_sentences = current_chunk_sentences[-self._calculate_overlap_sentences(current_chunk_sentences):]
                 current_chunk_sentences = overlap_sentences + [sentence]
-                current_chunk_tokens = sum(len(word_tokenize(s)) for s in current_chunk_sentences)
+                current_chunk_tokens = sum(self._count_tokens(s) for s in current_chunk_sentences)
             else:
                 current_chunk_sentences.append(sentence)
                 current_chunk_tokens += sentence_tokens
@@ -155,6 +201,22 @@ class AdvancedRAGSystem:
             chunks.append(self._create_chunk(chunk_text, page_num, doc_name, len(chunks)))
         
         return chunks
+    
+    def _simple_sentence_split(self, text: str) -> List[str]:
+        """Fallback sentence splitting when NLTK is not available"""
+        # Simple regex-based sentence splitting
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
+    
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens with fallback if NLTK not available"""
+        if NLTK_AVAILABLE:
+            try:
+                return len(word_tokenize(text))
+            except:
+                return len(text.split())
+        else:
+            return len(text.split())
     
     def _calculate_overlap_sentences(self, sentences: List[str]) -> int:
         """Calculate optimal overlap in sentences"""
@@ -167,9 +229,9 @@ class AdvancedRAGSystem:
     
     def _create_chunk(self, text: str, page_num: int, doc_name: str, chunk_id: int) -> Dict:
         """Create a standardized chunk object"""
-        token_count = len(word_tokenize(text))
+        token_count = self._count_tokens(text)
         
-        # Extract key information using NLP
+        # Extract key information using NLP (with fallbacks)
         entities = self._extract_chunk_entities(text)
         summary = self._create_chunk_summary(text)
         
@@ -180,10 +242,20 @@ class AdvancedRAGSystem:
             'chunk_id': chunk_id,
             'token_count': token_count,
             'char_count': len(text),
-            'sentence_count': len(sent_tokenize(text)),
+            'sentence_count': len(self._get_sentences(text)),
             'entities': entities,
             'summary': summary
         }
+    
+    def _get_sentences(self, text: str) -> List[str]:
+        """Get sentences with fallback"""
+        if NLTK_AVAILABLE:
+            try:
+                return sent_tokenize(text)
+            except:
+                return self._simple_sentence_split(text)
+        else:
+            return self._simple_sentence_split(text)
     
     def _extract_chunk_entities(self, text: str) -> Dict:
         """Extract entities from chunk using SpaCy"""
@@ -203,7 +275,7 @@ class AdvancedRAGSystem:
     
     def _create_chunk_summary(self, text: str) -> str:
         """Create a brief summary of the chunk"""
-        sentences = sent_tokenize(text)
+        sentences = self._get_sentences(text)
         if len(sentences) <= 2:
             return text[:100] + "..." if len(text) > 100 else text
         else:
@@ -424,7 +496,7 @@ class AdvancedRAGSystem:
     
     def _generate_summary_answer(self, context: str) -> str:
         """Generate summary-type answers"""
-        sentences = sent_tokenize(context)
+        sentences = self._get_sentences(context)
         if len(sentences) <= 3:
             return context
         
@@ -439,15 +511,15 @@ class AdvancedRAGSystem:
     def _generate_factual_answer(self, question: str, context: str, chunks: List[Dict]) -> str:
         """Generate factual answers with entity extraction"""
         # Extract key terms from question
-        question_terms = set(word_tokenize(question.lower()))
+        question_terms = set(question.lower().split())
         question_terms = {term for term in question_terms if len(term) > 3}
         
         # Find sentences that contain question terms
-        sentences = sent_tokenize(context)
+        sentences = self._get_sentences(context)
         relevant_sentences = []
         
         for sentence in sentences:
-            sentence_terms = set(word_tokenize(sentence.lower()))
+            sentence_terms = set(sentence.lower().split())
             if question_terms.intersection(sentence_terms):
                 relevant_sentences.append(sentence)
         
@@ -593,10 +665,17 @@ def main():
     st.sidebar.subheader("🤖 AI Model Status")
     if st.session_state.embedder:
         st.sidebar.success("✅ Embeddings: all-mpnet-base-v2")
-    if st.session_state.nlp:
+    if st.session_state.nlp and SPACY_AVAILABLE:
         st.sidebar.success("✅ NLP: SpaCy en_core_web_sm")
+    elif SPACY_AVAILABLE:
+        st.sidebar.warning("⚠️ SpaCy available but model not loaded")
     else:
-        st.sidebar.warning("⚠️ SpaCy not loaded - using fallback")
+        st.sidebar.info("ℹ️ SpaCy not available - using fallback")
+    
+    if NLTK_AVAILABLE:
+        st.sidebar.success("✅ NLTK: Available")
+    else:
+        st.sidebar.info("ℹ️ NLTK not available - using fallback")
     
     # File upload
     uploaded_file = st.sidebar.file_uploader(
